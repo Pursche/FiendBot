@@ -10,92 +10,67 @@ using TwitchLib.Api;
 using TwitchLib.Api.Helix;
 using TwitchLib.Api.Helix.Models.Streams.GetStreams;
 using TwitchLib.Client;
+using TwitchLib.Client.Interfaces;
 using TwitchLib.Client.Models;
 
 namespace FiendBot
 {
     internal class Program
     {
-        private static ConfigManager _configManager;
-        private static TwitchAPI _twitchApi;
-        private static TwitchClient _twitchClient;
-        private static DiscordSocketClient _discordClient;
-        private static string _vodThreadId = ""; // Store the thread ID for VOD comments
-        private static string _vodUrl = ""; // Store the VOD URL
-        private static string _discordBotToken = ""; // Discord bot token
-        private static DateTime _streamStartTimeUtc = DateTime.MinValue;
+        private static BotContext _context = new BotContext();
+
+        private static Task LogDiscord(LogMessage msg)
+        {
+            Console.WriteLine(msg.ToString());
+            return Task.CompletedTask;
+        }
 
         static async Task Main(string[] args)
         {
-            _configManager = new ConfigManager("config.yaml");
+            _context.config = new Config("config.yaml");
+            _context.db = new Config("db.yaml");
 
             // Twitch Setup
-            string twitchChannelName = _configManager.GetField<string>("twitch.channelName");
-            string twitchBotUsername = _configManager.GetField<string>("twitch.bot.name");
-            string twitchAccessToken = _configManager.GetField<string>("twitch.bot.token");
-            string twitchClientId = _configManager.GetField<string>("twitch.api.clientId");
-            string twitchClientSecret = _configManager.GetField<string>("twitch.api.clientSecret");
+            _context.channelName = _context.config.GetField<string>("twitch.channelName");
+            string twitchBotUsername = _context.config.GetField<string>("twitch.bot.name");
+            string twitchAccessToken = _context.config.GetField<string>("twitch.bot.token");
+            string twitchClientId = _context.config.GetField<string>("twitch.api.clientId");
+            string twitchClientSecret = _context.config.GetField<string>("twitch.api.clientSecret");
 
-            _twitchClient = new TwitchClient();
-            _twitchClient.Initialize(new ConnectionCredentials(twitchBotUsername, twitchAccessToken), twitchChannelName);
-            _twitchClient.OnMessageReceived += OnTwitchMessageReceived;
-            _twitchClient.Connect();
+            _context.twitchClient = new TwitchClient();
+            _context.twitchClient.Initialize(new ConnectionCredentials(twitchBotUsername, twitchAccessToken), _context.channelName);
+            _context.twitchClient.OnMessageReceived += OnTwitchMessageReceived;
+            _context.twitchClient.Connect();
 
             // Twitch API Setup
-            _twitchApi = new TwitchAPI();
-            _twitchApi.Settings.ClientId = twitchClientId;
-            _twitchApi.Settings.AccessToken = await GetTwitchApiAccessToken(twitchClientId, twitchClientSecret);
+            _context.twitchApi = new TwitchAPI();
+            _context.twitchApi.Settings.ClientId = twitchClientId;
+            _context.twitchApi.Settings.AccessToken = await TwitchUtils.GetTwitchApiAccessToken(twitchClientId, twitchClientSecret);
 
             // Discord Setup
-            _discordClient = new DiscordSocketClient();
-            _discordBotToken = _configManager.GetField<string>("discord.bot.token");
-            await _discordClient.LoginAsync(TokenType.Bot, _discordBotToken);
-            await _discordClient.StartAsync();
+            _context.discordClient = new DiscordSocketClient();
+            _context.discordBotToken = _context.config.GetField<string>("discord.bot.token");
+            await _context.discordClient.LoginAsync(TokenType.Bot, _context.discordBotToken);
+            await _context.discordClient.StartAsync();
 
-            _discordClient.Log += LogDiscord;
+            _context.discordClient.Log += LogDiscord;
 
-            while (_discordClient.ConnectionState != ConnectionState.Connected)
+            while (_context.discordClient.ConnectionState != ConnectionState.Connected)
             {
                 Console.WriteLine("Not connected to discord yet, waiting 5 seconds");
                 await Task.Delay(5000);
             }
 
             // Monitor Stream Status
-            await MonitorStreamStatus(twitchChannelName);
+            await MonitorStreamStatus();
 
             Console.WriteLine("Bot is running...");
             await Task.Delay(-1); // Keep the bot running
         }
 
-        private class TwitchTokenResponse
+        private static async Task MonitorStreamStatus()
         {
-            [JsonPropertyName("access_token")]
-            public string AccessToken { get; set; }
-
-            [JsonPropertyName("expires_in")]
-            public int ExpiresIn { get; set; }
-
-            [JsonPropertyName("token_type")]
-            public string TokenType { get; set; }
-        }
-
-        private static async Task<string> GetTwitchApiAccessToken(string clientId, string clientSecret)
-        {
-            using var httpClient = new HttpClient();
-            var response = await httpClient.PostAsync(
-                $"https://id.twitch.tv/oauth2/token?client_id={clientId}&client_secret={clientSecret}&grant_type=client_credentials",
-                null);
-
-            var responseBody = await response.Content.ReadAsStringAsync();
-            var tokenResponse = JsonSerializer.Deserialize<TwitchTokenResponse>(responseBody);
-
-            // tokenResponse.AccessToken now has the valid access token
-            return tokenResponse.AccessToken;
-        }
-
-        private static async Task MonitorStreamStatus(string twitchChannelName)
-        {
-            var channelInfo = await _twitchApi.Helix.Users.GetUsersAsync(logins: new List<string> { twitchChannelName });
+            var channelInfo = await _context.twitchApi.Helix.Users.GetUsersAsync(logins: new List<string> { _context.channelName });
             var channelId = channelInfo.Users.FirstOrDefault()?.Id;
 
             if (channelId == null)
@@ -104,9 +79,11 @@ namespace FiendBot
                 return;
             }
 
+            int streamStatusPollSpeed = _context.db.GetField("streamStatusPollSpeed",  60);
+
             while (true)
             {
-                var streamInfo = await _twitchApi.Helix.Streams.GetStreamsAsync(userIds: new List<string> { channelId });
+                var streamInfo = await _context.twitchApi.Helix.Streams.GetStreamsAsync(userIds: new List<string> { channelId });
 
                 if (streamInfo.Streams.Any())
                 {
@@ -114,156 +91,113 @@ namespace FiendBot
                     // Store the stream start time in UTC
                     DateTime streamStartTimeUtc = stream.StartedAt.ToUniversalTime();
 
-                    if (streamStartTimeUtc != _streamStartTimeUtc)
+                    if (streamStartTimeUtc != _context.streamStartTimeUtc)
                     {
-                        _streamStartTimeUtc = streamStartTimeUtc;
-                        Console.WriteLine("Stream went live!");
+                        _context.streamStartTimeUtc = streamStartTimeUtc;
                         Console.WriteLine("Fetching latest VOD...");
-                        await PostLatestVODLink(channelId);
+                        bool newStream = await PostLatestVODLink(channelId);
+                        if (newStream)
+                        {
+                            await PostLiveMessage(channelId);
+                        }
                     }
                 }
-                else if (_streamStartTimeUtc != DateTime.MinValue)
+                else if (_context.streamStartTimeUtc != DateTime.MinValue)
                 {
                     Console.WriteLine("Stream went offline!");
-                    _streamStartTimeUtc = DateTime.MinValue;
+                    _context.streamStartTimeUtc = DateTime.MinValue;
                 }
 
-                await Task.Delay(60000); // Check every 60 seconds
+                await Task.Delay(streamStatusPollSpeed * 1000);
             }
         }
 
-        private static async Task PostLatestVODLink(string channelId)
+        private static async Task PostLiveMessage(string channelId)
+        {
+            ulong discordChannelId = _context.config.GetField<ulong>("discord.liveChannelId");
+            var channel = _context.discordClient.GetChannel(discordChannelId) as ITextChannel;
+
+            if (channel != null)
+            {
+                string channelLink = $" https://twitch.tv/{_context.channelName}";
+                string liveMessage = _context.db.GetField<string>("liveMessage", "Went live: ") + channelLink;
+
+                // Post the message
+                await channel.SendMessageAsync($"{liveMessage}");
+            }
+        }
+
+        private static async Task<bool> PostLatestVODLink(string channelId)
         {
             // Fetch the latest VOD
-            var videos = await _twitchApi.Helix.Videos.GetVideosAsync(userId: channelId, first: 1);
+            var videos = await _context.twitchApi.Helix.Videos.GetVideosAsync(userId: channelId, first: 1);
 
             if (videos.Videos.Length > 0)
             {
-                _vodUrl = videos.Videos.First().Url;
+                _context.vodUrl = videos.Videos.First().Url;
 
-                ulong discordChannelId = _configManager.GetField<ulong>("discord.channelId");
-                var channel = _discordClient.GetChannel(discordChannelId) as ITextChannel;
+                ulong discordChannelId = _context.config.GetField<ulong>("discord.vodChannelId");
+                var channel = _context.discordClient.GetChannel(discordChannelId) as ITextChannel;
 
                 if (channel != null)
                 {
-                    var message = await channel.SendMessageAsync($"New VOD: {_vodUrl}");
-                    await Task.Delay(5000);
-                    await CreateThread(discordChannelId, message.Id, "VOD Comments", _discordBotToken);
+                    // Check if the VOD URL was already posted
+                    var messages = await channel.GetMessagesAsync(50).FlattenAsync();
+                    var existingMessage = messages.FirstOrDefault(m => m.Content.Contains(_context.vodUrl));
+
+                    if (existingMessage != null)
+                    {
+                        // If it was posted, try to get its thread ID
+                        if (existingMessage.Thread != null)
+                        {
+                            _context.vodThreadId = existingMessage.Thread.Id.ToString();
+                            Console.WriteLine($"VOD already posted. Thread ID: {_context.vodThreadId}");
+                        }
+                        else
+                        {
+                            Console.WriteLine("VOD already posted, but no thread found.");
+                        }
+                    }
+                    else
+                    {
+                        string newVODMessage = _context.db.GetField<string>("vodMessage", "New VOD:");
+
+                        // If not posted yet, post the message
+                        var message = await channel.SendMessageAsync($"{newVODMessage} {_context.vodUrl}");
+                        await Task.Delay(5000);
+                        await DiscordUtils.CreateThread(_context, discordChannelId, message.Id, "Timestamps", _context.discordBotToken);
+                        return true;
+                    }
                 }
             }
             else
             {
-                Console.WriteLine("No VOD found yet. Retrying...");
+                Console.WriteLine("No VOD found yet.");
             }
+            return false;
         }
 
-        private static void OnTwitchMessageReceived(object sender, TwitchLib.Client.Events.OnMessageReceivedArgs e)
+        // In your main/handler class (make sure it can handle async)
+        private static List<Commands.ICommand> _commands = new List<Commands.ICommand>
         {
-            // Only proceed if the message starts with "!timestamp "
-            if (!e.ChatMessage.Message.StartsWith("!timestamp "))
-                return;
+            new Commands.Timestamp(),
+            new Commands.SetCooldown(),
+            new Commands.SetMessage(),
+            new Commands.Blacklist(),
+            new Commands.Unblacklist(),
+            new Commands.Reload()
+        };
 
-            // Check user permissions
-            bool isBroadcaster = e.ChatMessage.IsBroadcaster;
-            bool isModerator = e.ChatMessage.IsModerator;
-            bool isSubscriber = e.ChatMessage.IsSubscriber;
-            bool isVip = e.ChatMessage.Badges != null && e.ChatMessage.Badges.Any(b => b.Key == "vip");
-
-            if (!isBroadcaster && !isModerator && !isSubscriber && !isVip)
-            {
-                // Inform the user they lack permission
-                _twitchClient.SendMessage(e.ChatMessage.Channel,
-                    $"@{e.ChatMessage.Username}, you do not have permission to use this command.");
-                return;
-            }
-
-            // Get the comment text after "!timestamp "
-            string comment = e.ChatMessage.Message.Substring("!timestamp ".Length);
-
-            // Convert the TmiSentTs to a DateTime in UTC
-            long messageTimeMs = long.Parse(e.ChatMessage.TmiSentTs);
-            DateTime messageTimeUtc = DateTimeOffset
-                .FromUnixTimeMilliseconds(messageTimeMs)
-                .UtcDateTime;
-
-            // Reply in Twitch chat to confirm
-            _twitchClient.SendMessage(e.ChatMessage.Channel,
-                $"@{e.ChatMessage.Username}, timestamp bookmarked: \"{comment}\"");
-
-            // Pass the time and comment along to your posting function
-            PostToDiscordThread(comment, messageTimeUtc);
-        }
-
-        private static async void PostToDiscordThread(string comment, DateTime messageTimeUtc)
+        private static async void OnTwitchMessageReceived(object sender, TwitchLib.Client.Events.OnMessageReceivedArgs e)
         {
-            if (_vodThreadId != "")
+            foreach (var command in _commands)
             {
-                ulong threadId = ulong.Parse(_vodThreadId);
-                var thread = _discordClient.GetChannel(threadId) as ITextChannel;
-
-                if (thread != null)
+                if (await command.CanExecute(_context, e.ChatMessage.Message))
                 {
-                    // Time since stream start
-                    TimeSpan offset = messageTimeUtc - _streamStartTimeUtc;
-
-                    // Format: 0h0m0s
-                    string offsetFormatted = $"{(int)offset.TotalHours}h{offset.Minutes}m{offset.Seconds}s";
-
-                    // Build the timestamped VOD URL
-                    string timestampLink = $"{_vodUrl}?t={offsetFormatted}";
-
-                    await thread.SendMessageAsync($"{timestampLink} - {comment}");
+                    await command.Execute(_context, e);
+                    break;
                 }
             }
-        }
-
-        private static string GetFormattedTimestamp(string twitchTimestamp)
-        {
-            TimeSpan t = TimeSpan.FromMilliseconds(long.Parse(twitchTimestamp));
-            return $"{t.Hours}h{t.Minutes}m{t.Seconds}s";
-        }
-
-        private static Task LogDiscord(LogMessage msg)
-        {
-            Console.WriteLine(msg.ToString());
-            return Task.CompletedTask;
-        }
-
-        private static async Task CreateThread(ulong channelId, ulong messageId, string threadName, string botToken)
-        {
-            using var client = new HttpClient();
-            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bot", botToken);
-
-            var payload = new
-            {
-                name = threadName,
-                auto_archive_duration = 1440 // 1 day in minutes
-            };
-
-            var jsonPayload = JsonSerializer.Serialize(payload);
-            var content = new StringContent(jsonPayload, Encoding.UTF8, "application/json");
-
-            var endpoint = $"https://discord.com/api/v10/channels/{channelId}/messages/{messageId}/threads";
-            var response = await client.PostAsync(endpoint, content);
-
-            if (response.IsSuccessStatusCode)
-            {
-                var responseBody = await response.Content.ReadAsStringAsync();
-                var threadData = JsonSerializer.Deserialize<DiscordThreadResponse>(responseBody);
-                _vodThreadId = threadData.Id; // Save the thread ID
-                Console.WriteLine($"Thread created successfully: {_vodThreadId}");
-            }
-            else
-            {
-                Console.WriteLine($"Failed to create thread: {response.StatusCode}");
-                Console.WriteLine(await response.Content.ReadAsStringAsync());
-            }
-        }
-
-        private class DiscordThreadResponse
-        {
-            [JsonPropertyName("id")]
-            public string Id { get; set; }
         }
     }
 }
